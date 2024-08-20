@@ -1,0 +1,6 @@
+domains:
+  - name: ai-tools.directory
+    email: admin@ai-tools.directory
+  # Add more domains as needed, for example:
+  # - name: example.com
+  #   email: admin@example.com

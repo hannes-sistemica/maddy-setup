@@ -1,0 +1,139 @@
+version: '3'
+
+services:
+  maddy:
+    image: foxcpp/maddy:latest
+    container_name: maddy
+    ports:
+      - "25:25"
+      - "143:143"
+      - "587:587"
+      - "993:993"
+    volumes:
+      - ./maddy/data:/data
+      - ./maddy/config:/config
+      - ./certs:/data/certificates:ro
+      - ./domains.yml:/domains.yml:ro
+    environment:
+      - MADDY_HOSTNAME=${PRIMARY_DOMAIN:-mail.example.com}
+    restart: unless-stopped
+
+  roundcube:
+    image: roundcube/roundcubemail:latest
+    container_name: roundcube
+    volumes:
+      - ./roundcube/config:/var/roundcube/config
+      - ./roundcube/db:/var/roundcube/db
+    environment:
+      - ROUNDCUBEMAIL_DEFAULT_HOST=tls://maddy
+      - ROUNDCUBEMAIL_SMTP_SERVER=tls://maddy
+    depends_on:
+      - maddy
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf:/etc/nginx/conf.d:ro
+      - ./certbot/www:/var/www/certbot:ro
+      - ./certs:/etc/letsencrypt:ro
+      - ./domains.yml:/domains.yml:ro
+    depends_on:
+      - roundcube
+    restart: unless-stopped
+
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+      - ./domains.yml:/domains.yml:ro
+    command: >
+      sh -c "
+      yq e '.domains[].name' /domains.yml | xargs -I {} 
+      certbot certonly --webroot --webroot-path=/var/www/certbot 
+      --email $$(yq e '.domains[0].email' /domains.yml) 
+      --agree-tos --no-eff-email --force-renewal -d {} -d mail.{}
+      "
+    entrypoint: >
+      sh -c "
+      trap exit TERM; while :; do
+        certbot renew
+        sleep 12h & wait $${!}
+      done
+      "
+
+  config-generator:
+    image: mikefarah/yq
+    volumes:
+      - ./domains.yml:/domains.yml:ro
+      - ./maddy/config:/output
+      - ./nginx/conf:/nginx-output
+    command: >
+      sh -c "
+      yq e '.domains[].name' /domains.yml > /output/domains &&
+      yq e '
+        .domains[] | 
+        "domain " + .name + "\n" +
+        "user admin@" + .name + "\n" +
+        "alias postmaster@" + .name + " admin@" + .name
+      ' /domains.yml >> /output/maddy-domains.conf &&
+      yq e '
+        .domains[] | 
+        "server {\n" +
+        "    listen 80;\n" +
+        "    server_name mail." + .name + ";\n" +
+        "    location /.well-known/acme-challenge/ {\n" +
+        "        root /var/www/certbot;\n" +
+        "    }\n" +
+        "    location / {\n" +
+        "        return 301 https://$host$request_uri;\n" +
+        "    }\n" +
+        "}\n" +
+        "server {\n" +
+        "    listen 443 ssl;\n" +
+        "    server_name mail." + .name + ";\n" +
+        "    ssl_certificate /etc/letsencrypt/live/mail." + .name + "/fullchain.pem;\n" +
+        "    ssl_certificate_key /etc/letsencrypt/live/mail." + .name + "/privkey.pem;\n" +
+        "    location / {\n" +
+        "        proxy_pass http://roundcube;\n" +
+        "        proxy_set_header Host $host;\n" +
+        "        proxy_set_header X-Real-IP $remote_addr;\n" +
+        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n" +
+        "        proxy_set_header X-Forwarded-Proto $scheme;\n" +
+        "    }\n" +
+        "}"
+      ' /domains.yml > /nginx-output/default.conf &&
+      echo 'server {
+          listen 80;
+          server_name ${WEBMAIL_DOMAIN};
+          location /.well-known/acme-challenge/ {
+              root /var/www/certbot;
+          }
+          location / {
+              return 301 https://$host$request_uri;
+          }
+      }
+      server {
+          listen 443 ssl;
+          server_name ${WEBMAIL_DOMAIN};
+          ssl_certificate /etc/letsencrypt/live/${WEBMAIL_DOMAIN}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/${WEBMAIL_DOMAIN}/privkey.pem;
+          location / {
+              proxy_pass http://roundcube;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+      }' >> /nginx-output/default.conf
+      "
+
+networks:
+  default:
+    name: email_network

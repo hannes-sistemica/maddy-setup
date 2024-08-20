@@ -1,0 +1,172 @@
+version: '3.8'
+
+services:
+  maddy:
+    image: foxcpp/maddy:latest
+    ports:
+      - "${SMTP_PORT:-25}:25"
+      - "${IMAP_PORT:-143}:143"
+      - "${SUBMISSION_PORT:-587}:587"
+      - "${SUBMISSIONS_PORT:-465}:465"
+    volumes:
+      - maddy_data:/data
+      - maddy_config:/config
+      - certs:/data/certificates:ro
+    configs:
+      - source: domains_config
+        target: /domains.yml
+    environment:
+      - MADDY_HOSTNAME=${PRIMARY_DOMAIN}
+      - TZ=${TZ:-UTC}
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  roundcube:
+    image: roundcube/roundcubemail:latest
+    volumes:
+      - roundcube_config:/var/roundcube/config
+      - roundcube_db:/var/roundcube/db
+    environment:
+      - ROUNDCUBEMAIL_DEFAULT_HOST=tls://${PRIMARY_DOMAIN}
+      - ROUNDCUBEMAIL_SMTP_SERVER=tls://${PRIMARY_DOMAIN}
+      - TZ=${TZ:-UTC}
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - nginx_conf:/etc/nginx/conf.d:ro
+      - certbot_www:/var/www/certbot:ro
+      - certs:/etc/letsencrypt:ro
+    configs:
+      - source: domains_config
+        target: /domains.yml
+    environment:
+      - TZ=${TZ:-UTC}
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    configs:
+      - source: domains_config
+        target: /domains.yml
+    environment:
+      - TZ=${TZ:-UTC}
+    command: >
+      sh -c "
+      yq e '.domains[].name' /domains.yml | xargs -I {} 
+      certbot certonly --webroot --webroot-path=/var/www/certbot 
+      --email ${CERTBOT_EMAIL} 
+      --agree-tos --no-eff-email --force-renewal -d {} -d mail.{}
+      "
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  config-generator:
+    image: mikefarah/yq
+    volumes:
+      - maddy_config:/output
+      - nginx_conf:/nginx-output
+    configs:
+      - source: domains_config
+        target: /domains.yml
+    environment:
+      - PRIMARY_DOMAIN=${PRIMARY_DOMAIN}
+      - WEBMAIL_DOMAIN=${WEBMAIL_DOMAIN}
+      - TZ=${TZ:-UTC}
+    command: >
+      sh -c "
+      yq e '.domains[].name' /domains.yml > /output/domains &&
+      yq e '
+        .domains[] | 
+        \"domain \" + .name + \"\n\" +
+        \"user admin@\" + .name + \"\n\" +
+        \"alias postmaster@\" + .name + \" admin@\" + .name
+      ' /domains.yml >> /output/maddy-domains.conf &&
+      yq e '
+        .domains[] | 
+        \"server {\n\" +
+        \"    listen 80;\n\" +
+        \"    server_name mail.\" + .name + \";\n\" +
+        \"    location /.well-known/acme-challenge/ {\n\" +
+        \"        root /var/www/certbot;\n\" +
+        \"    }\n\" +
+        \"    location / {\n\" +
+        \"        return 301 https://$host$request_uri;\n\" +
+        \"    }\n\" +
+        \"}\n\" +
+        \"server {\n\" +
+        \"    listen 443 ssl;\n\" +
+        \"    server_name mail.\" + .name + \";\n\" +
+        \"    ssl_certificate /etc/letsencrypt/live/mail.\" + .name + \"/fullchain.pem;\n\" +
+        \"    ssl_certificate_key /etc/letsencrypt/live/mail.\" + .name + \"/privkey.pem;\n\" +
+        \"    location / {\n\" +
+        \"        proxy_pass http://roundcube;\n\" +
+        \"        proxy_set_header Host $host;\n\" +
+        \"        proxy_set_header X-Real-IP $remote_addr;\n\" +
+        \"        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\" +
+        \"        proxy_set_header X-Forwarded-Proto $scheme;\n\" +
+        \"    }\n\" +
+        \"}\""
+      ' /domains.yml > /nginx-output/default.conf &&
+      echo 'server {
+          listen 80;
+          server_name ${WEBMAIL_DOMAIN};
+          location /.well-known/acme-challenge/ {
+              root /var/www/certbot;
+          }
+          location / {
+              return 301 https://$host$request_uri;
+          }
+      }
+      server {
+          listen 443 ssl;
+          server_name ${WEBMAIL_DOMAIN};
+          ssl_certificate /etc/letsencrypt/live/${WEBMAIL_DOMAIN}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/${WEBMAIL_DOMAIN}/privkey.pem;
+          location / {
+              proxy_pass http://roundcube;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+      }' >> /nginx-output/default.conf
+      "
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+volumes:
+  maddy_data:
+  maddy_config:
+  roundcube_config:
+  roundcube_db:
+  nginx_conf:
+  certbot_www:
+  certs:
+
+configs:
+  domains_config:
+    external: true
+
+networks:
+  default:
+    name: email_network
