@@ -117,7 +117,7 @@ domains:
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/email-server.git
+   git clone https://github.com/hannes-sistemica/maddy-setup.git
    cd email-server
    ```
 
